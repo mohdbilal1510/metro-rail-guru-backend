@@ -758,6 +758,193 @@ app.post('/api/seed', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────
+//  MODELS — ARTICLE REACTIONS & COMMENTS
+// ─────────────────────────────────────────────────────────────────
+
+const ArticleReactionSchema = new mongoose.Schema({
+  articleSlug: { type: String, required: true },
+  reaction:    { type: String, enum: ['LIKE', 'DISLIKE'], required: true },
+  sessionId:   { type: String, required: true },
+  createdAt:   { type: Date, default: Date.now },
+});
+ArticleReactionSchema.index({ articleSlug: 1, sessionId: 1 }, { unique: true });
+const ArticleReaction = mongoose.model('ArticleReaction', ArticleReactionSchema);
+
+const ArticleCommentSchema = new mongoose.Schema({
+  articleSlug: { type: String, required: true },
+  name:        { type: String, required: true, trim: true },
+  email:       { type: String, trim: true, lowercase: true },
+  comment:     { type: String, required: true, trim: true },
+  isApproved:  { type: Boolean, default: true },
+  createdAt:   { type: Date, default: Date.now },
+});
+ArticleCommentSchema.index({ articleSlug: 1, createdAt: -1 });
+const ArticleComment = mongoose.model('ArticleComment', ArticleCommentSchema);
+
+// ─────────────────────────────────────────────────────────────────
+//  ROUTES — ARTICLE REACTIONS
+// ─────────────────────────────────────────────────────────────────
+
+// GET /api/articles/:slug/reactions
+app.get('/api/articles/:slug/reactions', async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const sessionId = req.query.sessionId || '';
+
+    const [likes, dislikes, userReaction] = await Promise.all([
+      ArticleReaction.countDocuments({ articleSlug: slug, reaction: 'LIKE' }),
+      ArticleReaction.countDocuments({ articleSlug: slug, reaction: 'DISLIKE' }),
+      sessionId
+        ? ArticleReaction.findOne({ articleSlug: slug, sessionId })
+        : null,
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        likes,
+        dislikes,
+        userReaction: userReaction ? userReaction.reaction : null,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/articles/:slug/reactions
+app.post('/api/articles/:slug/reactions', async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const { reaction, sessionId } = req.body;
+
+    if (!reaction || !['LIKE', 'DISLIKE'].includes(reaction))
+      return res.status(400).json({ error: 'reaction must be LIKE or DISLIKE' });
+    if (!sessionId)
+      return res.status(400).json({ error: 'sessionId is required' });
+
+    const existing = await ArticleReaction.findOne({ articleSlug: slug, sessionId });
+
+    if (existing) {
+      if (existing.reaction === reaction) {
+        // Toggle off — remove reaction
+        await ArticleReaction.deleteOne({ _id: existing._id });
+      } else {
+        // Switch reaction
+        existing.reaction = reaction;
+        await existing.save();
+      }
+    } else {
+      await ArticleReaction.create({ articleSlug: slug, reaction, sessionId });
+    }
+
+    const [likes, dislikes, updated] = await Promise.all([
+      ArticleReaction.countDocuments({ articleSlug: slug, reaction: 'LIKE' }),
+      ArticleReaction.countDocuments({ articleSlug: slug, reaction: 'DISLIKE' }),
+      ArticleReaction.findOne({ articleSlug: slug, sessionId }),
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        likes,
+        dislikes,
+        userReaction: updated ? updated.reaction : null,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
+//  ROUTES — ARTICLE COMMENTS
+// ─────────────────────────────────────────────────────────────────
+
+// GET /api/articles/:slug/comments
+app.get('/api/articles/:slug/comments', async (req, res) => {
+  try {
+    const comments = await ArticleComment.find({
+      articleSlug: req.params.slug,
+      isApproved: true,
+    }).sort({ createdAt: -1 });
+
+    res.json({ success: true, count: comments.length, data: comments });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/articles/:slug/comments
+app.post(
+  '/api/articles/:slug/comments',
+  [
+    body('name').trim().notEmpty().withMessage('Name is required'),
+    body('comment').trim().isLength({ min: 5 }).withMessage('Comment must be at least 5 characters'),
+    body('email').optional({ checkFalsy: true }).isEmail().withMessage('Invalid email'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty())
+      return res.status(400).json({ error: errors.array()[0].msg });
+
+    try {
+      const { name, email, comment } = req.body;
+      const newComment = await ArticleComment.create({
+        articleSlug: req.params.slug,
+        name,
+        email: email || undefined,
+        comment,
+        isApproved: true,
+      });
+
+      res.status(201).json({ success: true, data: newComment });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────────
+//  ROUTES — ADMIN COMMENT MODERATION
+// ─────────────────────────────────────────────────────────────────
+
+// GET /api/admin/comments  (admin)
+app.get('/api/admin/comments', protect, adminOnly, async (req, res) => {
+  try {
+    const comments = await ArticleComment.find().sort({ createdAt: -1 });
+    res.json({ success: true, count: comments.length, data: comments });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/admin/comments/:id  (admin — approve/hide)
+app.patch('/api/admin/comments/:id', protect, adminOnly, async (req, res) => {
+  try {
+    const { isApproved } = req.body;
+    const comment = await ArticleComment.findByIdAndUpdate(
+      req.params.id,
+      { isApproved },
+      { new: true }
+    );
+    res.json({ success: true, data: comment });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/admin/comments/:id  (admin)
+app.delete('/api/admin/comments/:id', protect, adminOnly, async (req, res) => {
+  try {
+    await ArticleComment.findByIdAndDelete(req.params.id);
+    res.json({ success: true, message: 'Comment deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
 //  HEALTH CHECK
 // ─────────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
